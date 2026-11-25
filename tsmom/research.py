@@ -71,7 +71,7 @@ def features(df, rf):
     m["Fixed50"] = .5
     return m
 
-def schedule(df, m, start, end):
+def schedule(df, m, start, end, auto_start=False):
     idx = df.loc[start:end].index
     if len(idx) < 2:
         raise ValueError("Need at least two trading dates in requested period")
@@ -80,8 +80,28 @@ def schedule(df, m, start, end):
     s.index = idx
     s["rebalance"] = np.r_[True, prior[1:] != prior[:-1]]
     required = ["M1", "M2", "M2_cont", "M3"]
-    if s[required].isna().any().any():
-        raise ValueError("Missing momentum warm-up / calendar month. Download earlier history or check missing months.")
+    ready = s[required].notna().all(axis=1) & s.signal_date.notna()
+    if not ready.all():
+        if not ready.any():
+            raise ValueError(f"No complete signal between {start} and {end}. "
+                             f"Price history begins {df.index.min().date()}; "
+                             "need 12 monthly returns and 252 daily returns.")
+        first = ready[ready].index[0]
+        if not ready.loc[first:].all():
+            missing = s.index[~ready & (s.index >= first)]
+            raise ValueError(f"Missing signals AFTER warm-up: {missing[:10].date.tolist()}. "
+                             "Check missing calendar months or invalid features.")
+        if not auto_start:
+            raise ValueError(f"Warm-up incomplete at requested start {start}. "
+                             f"Earliest common tradable date: {first.date()}. "
+                             "Use --start with that date or --auto-start explicitly.")
+        print(f"WARNING: requested start {start}; effective start {first.date()} "
+              "because warm-up is incomplete. All models use identical dates.")
+        s = s.loc[first:].copy()
+        idx = s.index
+        s.loc[idx[0], "rebalance"] = True
+    if len(s) < 2:
+        raise ValueError("Fewer than two trading dates after warm-up.")
     if not (pd.to_datetime(s.signal_date).to_numpy() < idx.to_numpy()).all():
         raise AssertionError("Signal must precede execution")
     return s
@@ -149,10 +169,11 @@ def metrics(d, bench, rf):
             "cost_initial_capital_units":d.cost.sum(),
             "trade_count":int((d.turnover>1e-10).sum())}
 
-def run(df, start, end, rf, commission, tax, slip, out):
+def run(df, start, end, rf, commission, tax, slip, out, auto_start=False):
     df = df.loc[:end].copy()  # Never evaluate future holdout rows.
     m = features(df, rf)
-    s = schedule(df,m,start,end)
+    s = schedule(df,m,start,end,auto_start=auto_start)
+    print(f"Evaluation: {s.index[0].date()} to {s.index[-1].date()} ({len(s)} trading observations)")
     opens = df.loc[s.index,"total_open"]
     models = ["M0","M1","M2","M2_cont","M3","Fixed50"]
     results, stats = [], []
@@ -162,7 +183,9 @@ def run(df, start, end, rf, commission, tax, slip, out):
             avg = paths[n].weight.iloc[:-1].mean()
             paths["matched_"+n] = simulate(opens,np.full(len(s),avg),s.rebalance,rf,*rates)
         for n,d in paths.items():
-            stats.append({"scenario":scenario,"model":n,**metrics(d,paths["M0"],rf)})
+            stats.append({"scenario":scenario,"model":n,"start":str(d.index[0].date()),
+                          "end":str(d.index[-1].date()),"observations":len(d),
+                          **metrics(d,paths["M0"],rf)})
             results.append(d.assign(model=n,scenario=scenario,signal_date=s.signal_date))
     out = Path(out); out.mkdir(parents=True,exist_ok=True)
     summary = pd.DataFrame(stats)
@@ -188,6 +211,25 @@ def self_test():
     m = features(df,0.)
     s = schedule(df,m,"2003-01-01","2004-12-31")
     assert (s.M1==1).all() and (s.M2==1).all()
+    short = df.loc["2002-01-01":]
+    sm = features(short,0.)
+    try:
+        schedule(short,sm,"2002-01-01","2004-12-31")
+    except ValueError as exc:
+        assert "Earliest common tradable date" in str(exc)
+    else:
+        raise AssertionError("Incomplete warm-up must fail by default")
+    trimmed = schedule(short,sm,"2002-01-01","2004-12-31",auto_start=True)
+    assert trimmed.index[0] >= pd.Timestamp("2003-02-01")
+    assert trimmed.rebalance.iloc[0] and trimmed[["M1","M2","M2_cont","M3"]].notna().all().all()
+    broken = sm.copy()
+    broken.loc[pd.Period("2003-08",freq="M"),"M3"] = np.nan
+    try:
+        schedule(short,broken,"2002-01-01","2004-12-31",auto_start=True)
+    except ValueError as exc:
+        assert "AFTER warm-up" in str(exc)
+    else:
+        raise AssertionError("Interior missing signal must fail even with auto-start")
     assert s.M3.between(0,1).all()
     modified = df.copy()
     modified.loc["2004-01-01":,"Adj Close"] *= 2
@@ -226,6 +268,7 @@ def main():
     p.add_argument("--download",action="store_true")
     p.add_argument("--drop-invalid",action="store_true",help="Exploratory only: exclude audited invalid rows, never impute prices")
     p.add_argument("--self-test",action="store_true")
+    p.add_argument("--auto-start",action="store_true",help="Explicitly allow trimming leading incomplete warm-up; never skip interior gaps")
     p.add_argument("--start",default="2005-01-01")
     p.add_argument("--end",default="2015-12-31")
     p.add_argument("--rf",type=float,default=.015)
@@ -250,7 +293,7 @@ def main():
             raise RuntimeError("Yahoo Finance returned no data")
         raw.index.name="Date"; raw.to_csv(a.input)
     run(load_data(a.input,drop_invalid=a.drop_invalid,start=a.start,end=a.end),
-        a.start,a.end,a.rf,a.commission,a.tax,a.slippage,a.out)
+        a.start,a.end,a.rf,a.commission,a.tax,a.slippage,a.out,auto_start=a.auto_start)
 
 if __name__ == "__main__":
     main()
