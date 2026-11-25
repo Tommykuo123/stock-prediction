@@ -6,7 +6,61 @@ import pandas as pd
 
 HORIZONS = (1, 3, 6, 12)
 
-def load_data(path, drop_invalid=False, start="2005-01-01", end=None):
+def audit_price_continuity(df, path, repair_yahoo_0050_split=False):
+    """Audit both feature prices and executable total-return open proxy.
+    Apply only the documented Yahoo 0050 discontinuity, with explicit opt-in
+    and a matching fourfold jump in BOTH series. Never modify source CSV."""
+    df = df.copy()
+    df["total_open"] = df.Open * df["Adj Close"] / df.Close
+    cols = ["Adj Close", "total_open"]
+    before = df[cols].pct_change(fill_method=None)
+    applied = False
+    if repair_yahoo_0050_split:
+        left, right = pd.Timestamp("2013-12-31"), pd.Timestamp("2014-01-02")
+        if left in df.index and right in df.index:
+            if df.index.get_loc(right) != df.index.get_loc(left)+1:
+                raise ValueError("Unexpected dates around known Yahoo split discontinuity.")
+            ratios = df.loc[right, cols] / df.loc[left, cols]
+            split_signature = ((ratios * 4 >= .90) & (ratios * 4 <= 1.10))
+            already_continuous = ((ratios >= .90) & (ratios <= 1.10))
+            if split_signature.all():
+                # Scale total-return CLOSE only; recompute OPEN from same
+                # Open/Close ratio so feature and execution scales agree.
+                df.loc[df.index <= left, "Adj Close"] /= 4.
+                df["total_open"] = df.Open * df["Adj Close"] / df.Close
+                applied = True
+                print("WARNING: applied exploratory Yahoo 0050 correction: adjusted prices through 2013-12-31 / 4.")
+            elif already_continuous.all():
+                print("No split correction applied: both boundary ratios already continuous.")
+            else:
+                raise ValueError(f"Mixed or unexpected boundary ratios: {ratios.to_dict()}. "
+                                 "Inspect original Open, Close, Adj Close; do not guess a correction.")
+        elif df.index.min() < right <= df.index.max():
+            raise ValueError("Data spans the Yahoo discontinuity but boundary dates are missing.")
+        else:
+            print("No split correction applied: sample does not span 2014 boundary.")
+    after = df[cols].pct_change(fill_method=None)
+    audit = pd.DataFrame({
+        "adjusted_close_return_before": before["Adj Close"],
+        "total_open_return_before": before["total_open"],
+        "adjusted_close_return_after": after["Adj Close"],
+        "total_open_return_after": after["total_open"],
+        "adjustment_factor": np.where(applied & (df.index < pd.Timestamp("2014-01-01")), .25, 1.),
+    })
+    audit_path = Path(path).with_suffix(".price_jumps.csv")
+    flagged = (before.abs().ge(.07).any(axis=1) | after.abs().ge(.07).any(axis=1))
+    audit.loc[flagged].to_csv(audit_path)
+    print(f"Price continuity audit (absolute daily changes >= 7%): {flagged.sum()} dates; {audit_path}")
+    if flagged.any():
+        print(audit.loc[flagged].head(20).to_string())
+    severe = after.abs().ge(.20).any(axis=1)
+    if severe.any():
+        raise ValueError(f"Extreme price changes on {df.index[severe].date.tolist()[:10]}. "
+                         f"Inspect {audit_path}; for a matching known 0050 Yahoo boundary only, "
+                         "use --repair-yahoo-0050-split. No other extreme changes are auto-corrected.")
+    return df
+
+def load_data(path, drop_invalid=False, start="2005-01-01", end=None, repair_yahoo_0050_split=False):
     """Keep raw CSV intact; audit invalid rows before any optional exclusion."""
     df = pd.read_csv(path, parse_dates=["Date"]).set_index("Date").sort_index()
     cols = ["Open", "Close", "Adj Close"]
@@ -43,7 +97,7 @@ def load_data(path, drop_invalid=False, start="2005-01-01", end=None):
         print(f"WARNING: excluding {bad.sum()} rows "
               f"({leading.sum()} leading, {unsafe.sum()} other); no prices imputed.")
         df = df.loc[~bad].copy()
-    df["total_open"] = df.Open * df["Adj Close"] / df.Close
+    df = audit_price_continuity(df, path, repair_yahoo_0050_split)
     print(f"Valid daily data: {len(df)} rows, {df.index.min().date()} to {df.index.max().date()}")
     return df
 
@@ -260,13 +314,36 @@ def self_test():
         sample = sample.drop(index=2)
         sample.to_csv(pth,index=False)
         assert len(load_data(pth))==2
-    print("Synthetic tests passed: causal features, buy-and-hold, fees, sell tax, cash, invalid-price audit.")
+        split = pd.DataFrame({"Open":[60.,15.,15.1],"Close":[60.,15.1,15.2],
+                              "Adj Close":[36.,9.06,9.12]},
+                             index=pd.to_datetime(["2013-12-31","2014-01-02","2014-01-03"]))
+        try:
+            audit_price_continuity(split,pth)
+        except ValueError as exc:
+            assert "Extreme price changes" in str(exc)
+        else:
+            raise AssertionError("Unrepaired fourfold discontinuity must fail")
+        repaired = audit_price_continuity(split,pth,True)
+        np.testing.assert_allclose(repaired["Adj Close"],[9.,9.06,9.12])
+        np.testing.assert_allclose(repaired.total_open,[9.,9.,9.06])
+        assert split["Adj Close"].iloc[0]==36.
+        pd.testing.assert_frame_equal(repaired,audit_price_continuity(repaired,pth,True))
+        mixed = split.copy()
+        mixed.loc["2014-01-02","Open"] *= 4.
+        try:
+            audit_price_continuity(mixed,pth,True)
+        except ValueError as exc:
+            assert "Mixed or unexpected" in str(exc)
+        else:
+            raise AssertionError("Mixed-scale opens must not be repaired automatically")
+    print("Synthetic tests passed: causal features, buy-and-hold, fees, sell tax, cash, invalid-price audit, price continuity.")
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--input",default="0050_daily.csv")
     p.add_argument("--download",action="store_true")
     p.add_argument("--drop-invalid",action="store_true",help="Exploratory only: exclude audited invalid rows, never impute prices")
+    p.add_argument("--repair-yahoo-0050-split",action="store_true",help="Exploratory only: repair matching 2014-01-02 Yahoo 0050 fourfold price discontinuity")
     p.add_argument("--self-test",action="store_true")
     p.add_argument("--auto-start",action="store_true",help="Explicitly allow trimming leading incomplete warm-up; never skip interior gaps")
     p.add_argument("--start",default="2005-01-01")
@@ -292,7 +369,8 @@ def main():
         if raw.empty:
             raise RuntimeError("Yahoo Finance returned no data")
         raw.index.name="Date"; raw.to_csv(a.input)
-    run(load_data(a.input,drop_invalid=a.drop_invalid,start=a.start,end=a.end),
+    run(load_data(a.input,drop_invalid=a.drop_invalid,start=a.start,end=a.end,
+                  repair_yahoo_0050_split=a.repair_yahoo_0050_split),
         a.start,a.end,a.rf,a.commission,a.tax,a.slippage,a.out,auto_start=a.auto_start)
 
 if __name__ == "__main__":
