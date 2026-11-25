@@ -27,3 +27,6 @@ Signal uses last observed trading-day close in prior calendar month. Trade at ne
 Outputs: daily equity and returns, signal/target/turnover/cost log, summary, equity chart, monthly feature data. Gross and net paths are independently simulated. Sharpe uses daily excess returns (all trading days, including cash days), annualized by sqrt(252); alpha is arithmetic annualized OLS intercept vs 0050 excess return, not a significance test. Sample start equity is 1, no historical positions inherited. No performance has been verified against live market data in this repository yet.
 
 Data files and generated outputs should remain local. Do not commit API keys or licensed data.
+
+## Invalid price rows
+The loader writes an audit CSV next to the input (e.g. 0050_daily.invalid.csv) containing dates, price fields and invalid_fields. Leading invalid rows before the requested evaluation start are excluded with a warning; any other invalid row stops the strict run. Investigate against a second source before using the result. For exploratory runs only, use `python tsmom/research.py --input 0050_daily.csv --drop-invalid`; this explicitly excludes invalid dates, which may affect monthly signals, execution dates, volatility and performance. No price imputation is performed and the original CSV is retained. Run `--self-test` to exercise the synthetic audit checks.
