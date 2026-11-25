@@ -6,15 +6,45 @@ import pandas as pd
 
 HORIZONS = (1, 3, 6, 12)
 
-def load_data(path):
+def load_data(path, drop_invalid=False, start="2005-01-01", end=None):
+    """Keep raw CSV intact; audit invalid rows before any optional exclusion."""
     df = pd.read_csv(path, parse_dates=["Date"]).set_index("Date").sort_index()
     cols = ["Open", "Close", "Adj Close"]
     if df.index.has_duplicates or df.index.isna().any():
         raise ValueError("Duplicate or invalid dates")
+    if end is not None:
+        df = df.loc[:end].copy()
     df = df[cols].apply(pd.to_numeric, errors="raise")
-    if df.empty or not np.isfinite(df.to_numpy()).all() or (df <= 0).any().any():
-        raise ValueError("Missing or nonpositive price data")
+    bad_cells = ~np.isfinite(df) | (df <= 0)
+    bad = bad_cells.any(axis=1)
+    audit_path = Path(path).with_suffix(".invalid.csv")
+    audit = df.loc[bad].copy()
+    audit["invalid_fields"] = [
+        ", ".join(bad_cells.columns[row]) for row in bad_cells.loc[bad].to_numpy()
+    ]
+    audit.to_csv(audit_path)
+    if df.empty or bad.all():
+        raise ValueError(f"No valid price data. See {audit_path}")
+    if bad.any():
+        print(f"Invalid price rows: {bad.sum()} / {len(df)}")
+        print(audit.head(20).to_string())
+        print(f"Full audit: {audit_path}")
+        # Pre-listing / leading invalid observations may be trimmed; no prices
+        # are invented. All other invalid dates require explicit permission.
+        first_valid = df.index[~bad][0]
+        leading = bad & (df.index < first_valid) & (df.index < pd.Timestamp(start))
+        unsafe = bad & ~leading
+        if unsafe.any() and not drop_invalid:
+            raise ValueError(
+                f"{unsafe.sum()} invalid row(s) outside leading warm-up. "
+                f"Inspect {audit_path}; recover missing prices if possible. "
+                "For an exploratory run only, pass --drop-invalid."
+            )
+        print(f"WARNING: excluding {bad.sum()} rows "
+              f"({leading.sum()} leading, {unsafe.sum()} other); no prices imputed.")
+        df = df.loc[~bad].copy()
     df["total_open"] = df.Open * df["Adj Close"] / df.Close
+    print(f"Valid daily data: {len(df)} rows, {df.index.min().date()} to {df.index.max().date()}")
     return df
 
 def features(df, rf):
@@ -169,12 +199,32 @@ def self_test():
     np.testing.assert_allclose(d.equity.iloc[0],1/1.001)
     np.testing.assert_allclose(d.equity.iloc[-1],.99/1.001*(1-.003))
     assert d.tax.iloc[0]==0 and d.tax.iloc[-1]>0 and d.weight.iloc[-1]==0
-    print("Synthetic tests passed: causal features, buy-and-hold, fees, sell tax, cash.")
+    from tempfile import TemporaryDirectory
+    with TemporaryDirectory() as tmp:
+        pth = Path(tmp)/"prices.csv"
+        sample = pd.DataFrame({"Date":["2003-01-01","2003-01-02","2003-01-03","2003-01-06"],
+                               "Open":[0,100,0,101],"Close":[0,100,100,101],
+                               "Adj Close":[0,100,100,101]})
+        sample.to_csv(pth,index=False)
+        try:
+            load_data(pth)
+        except ValueError as exc:
+            assert "outside leading" in str(exc)
+        else:
+            raise AssertionError("Internal invalid row must fail strict validation")
+        clean = load_data(pth,drop_invalid=True)
+        assert len(clean)==2 and clean.total_open.tolist()==[100,101]
+        assert len(pd.read_csv(pth.with_suffix(".invalid.csv")))==2
+        sample = sample.drop(index=2)
+        sample.to_csv(pth,index=False)
+        assert len(load_data(pth))==2
+    print("Synthetic tests passed: causal features, buy-and-hold, fees, sell tax, cash, invalid-price audit.")
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--input",default="0050_daily.csv")
     p.add_argument("--download",action="store_true")
+    p.add_argument("--drop-invalid",action="store_true",help="Exploratory only: exclude audited invalid rows, never impute prices")
     p.add_argument("--self-test",action="store_true")
     p.add_argument("--start",default="2005-01-01")
     p.add_argument("--end",default="2015-12-31")
@@ -199,7 +249,8 @@ def main():
         if raw.empty:
             raise RuntimeError("Yahoo Finance returned no data")
         raw.index.name="Date"; raw.to_csv(a.input)
-    run(load_data(a.input),a.start,a.end,a.rf,a.commission,a.tax,a.slippage,a.out)
+    run(load_data(a.input,drop_invalid=a.drop_invalid,start=a.start,end=a.end),
+        a.start,a.end,a.rf,a.commission,a.tax,a.slippage,a.out)
 
 if __name__ == "__main__":
     main()
